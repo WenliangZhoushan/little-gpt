@@ -24,11 +24,13 @@ class CausalSelfAttention(nn.Module):
 
         self.c_attn = nn.Linear(config.n_embd, config.n_embd * 3)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        # why not (block_size, n_embd)?
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                            .view(1, 1, config.block_size, config.block_size))
+        self.register_buffer(
+            "bias", torch.tril(torch.ones(config.block_size, config.block_size))
+            .view(1, 1, config.block_size, config.block_size)
+        )
 
     def forward(self, x):
         B, T, C = x.size() # batch_size, seq_len, n_embd
@@ -38,7 +40,7 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         attn = (q @ k.transpose(-2, -1)) * ((k.size(-1)) ** -0.5 * 1.0)
-        attn = attn.masked_fill(self.bias[:, :, T, T] == 0, float('-inf'))
+        attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
         attn = F.softmax(attn, dim=-1)
         y = attn @ v # batch_size, n_head, seq_len, seq_len @ batch_size, n_head, seq_len, head_size
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -53,6 +55,8 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, config.n_embd * 4)
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(config.n_embd * 4, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
+
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -92,7 +96,24 @@ class GPT(nn.Module):
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+        # weights sharing
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        std = 0.02
+        if hasattr(module, 'NANOGPT_SCALE_INIT'):
+            std *= (2 * self.config.n_layer) ** -0.5
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, std=0.02)
+
+    def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
@@ -103,7 +124,10 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
@@ -167,19 +191,61 @@ class GPT(nn.Module):
 num_return_sequences = 5
 max_length = 30
 
-model = GPT.from_pretrained('gpt2')
-model.eval()
-model.to('cuda')
+device = 'cuda'
+
 
 import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode('Hello, I am a language model,')
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to('cuda')
+
+class DataLoaderLite:
+    
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        with open(f'input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+
+        self.cur_pos = 0
+    
+    def next_batch(self):
+        if self.cur_pos + self.B * self.T + 1 >= len(self.tokens):
+            self.cur_pos = 0
+        buf = self.tokens[self.cur_pos: self.cur_pos + self.B * self.T + 1]
+        x = buf[:-1].view(self.B, self.T).to(device)
+        y = buf[1:].view(self.B, self.T).to(device)
+        self.cur_pos += self.B * self.T
+        return x, y
+
+train_loader = DataLoaderLite(16, 1024)
+
+torch.set_float32_matmul_precision('high')
+
+model = GPT(GPTConfig())
+model.to('cuda')
+
+# logits, loss = model(x, y)
+# print(logits.shape, loss)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f'step {i}, loss: {loss.item()}')
+
+import sys
+sys.exit(0)
 
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
+
+# model = GPT.from_pretrained('gpt2')
+
 while x.size(1) < max_length:
     with torch.no_grad():
         logits = model(x)
